@@ -1,0 +1,17 @@
+{
+  "name": "poligon-mp-server",
+  "version": "2.0.0",
+  "description": "WebSocket multiplayer server for Poligon (HTML + Unity clients)",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

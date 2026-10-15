@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: multiplayer-poligon
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci --omit=dev || npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

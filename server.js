@@ -1,11 +1,22 @@
 /**
- * Poligon multiplayer server — v2
+ * Poligon multiplayer server — v3
  * Render: Web Service, Start: node server.js, Health: /health
+ *
+ * v3 (on top of v2):
+ *  - every room has a map (arena | mirage | sandstone | province | rust | zone9), chosen by the
+ *    first player via {type:'join', map:'province'} and reported back in 'welcome'
+ *  - spawn points come from the room's map (maps.js) and prefer the point farthest from other players
+ *  - only the room owner (oldest player) can change the map; a change respawns everyone
+ *  - 'hit' is rejected when there is a wall between shooter and target (no shooting through walls)
+ *    LOS_MODE env: enforce (default) | log (only log would-be rejections) | off
+ *  - fixed: re-joining another room left a ghost player in the old room
  */
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const { MAPS, DEFAULT_MAP, hasLineOfSight } = require('./maps');
 
 const PORT = process.env.PORT || 3000;
+const LOS_MODE = String(process.env.LOS_MODE || 'enforce').toLowerCase();
 const MAX_PER_ROOM = 6;
 const MAX_NAME_LEN = 18;
 const MAX_ROOM_LEN = 12;
@@ -16,15 +27,10 @@ const STATE_MIN_INTERVAL_MS = 30;
 const SPAWN_PROTECTION_MS = 3000;
 const HEARTBEAT_MS = 25000;
 
-const SPAWN_POINTS = [
-  { x: -16, y: 1.6, z: -22 },
-  { x:  16, y: 1.6, z: -22 },
-  { x: -18, y: 1.6, z:  20 },
-  { x:  18, y: 1.6, z:  20 },
-  { x:   0, y: 1.6, z:  24 }
-];
+const rooms = new Map();      // room key -> Map(playerId -> player)
+const roomMaps = new Map();   // room key -> map id
+const losLogAt = new Map();   // shooter id -> last LOS log time (keeps the log readable)
 
-const rooms = new Map();
 const clampNum = (v, min, max, fb = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fb;
@@ -38,11 +44,22 @@ const sanitizeRoom = (v) => {
   return s || 'LOBBY';
 };
 const sanitizeId = (v) => String(v ?? '').replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 24);
+// 'Zone9', 'zone_9', 'ZONE9' -> 'zone9'; unknown -> null
+const sanitizeMap = (v) => {
+  const s = String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return Object.prototype.hasOwnProperty.call(MAPS, s) ? s : null;
+};
 
 function roomOf(code) {
   const key = sanitizeRoom(code);
   if (!rooms.has(key)) rooms.set(key, new Map());
   return { key, players: rooms.get(key) };
+}
+function mapOfRoom(key) { return roomMaps.get(key) || DEFAULT_MAP; }
+function ownerId(players) {
+  let best = null;
+  for (const id of players.keys()) if (best === null || Number(id) < Number(best)) best = id;
+  return best;
 }
 function publicPlayer(p) {
   return {
@@ -68,13 +85,57 @@ function broadcast(key, obj, exceptId = null) {
     if (p.ws && p.ws.readyState === 1) p.ws.send(raw);
   }
 }
-function pickSpawn() {
-  const s = SPAWN_POINTS[(Math.random() * SPAWN_POINTS.length) | 0];
+
+// Spawn of the room's map: the point farthest from everybody else (small random term breaks ties),
+// plus a little jitter so two players spawning in a row do not stand on the same spot.
+function pickSpawn(mapId, players, exceptId) {
+  const list = (MAPS[mapId] || MAPS[DEFAULT_MAP]).spawns;
+  const others = [];
+  if (players) for (const p of players.values()) if (p.id !== exceptId) others.push(p);
+  let best = list[0], bestScore = -1;
+  for (const s of list) {
+    let d = Infinity;
+    for (const p of others) d = Math.min(d, Math.hypot(p.x - s[0], p.z - s[2]));
+    const score = (others.length ? Math.min(d, 60) : 0) + Math.random() * 2;
+    if (score > bestScore) { bestScore = score; best = s; }
+  }
   return {
-    x: s.x + (Math.random() - 0.5) * 1.2,
-    y: s.y,
-    z: s.z + (Math.random() - 0.5) * 1.2
+    x: best[0] + (Math.random() - 0.5) * 1.2,
+    y: best[1],
+    z: best[2] + (Math.random() - 0.5) * 1.2
   };
+}
+
+// Authoritative respawn: new position, full hp, spawn shield; the player is told with a 'state'.
+function respawn(p, players) {
+  const sp = pickSpawn(mapOfRoom(p.room), players, p.id);
+  p.x = sp.x; p.y = sp.y; p.z = sp.z;
+  p.hp = 100;
+  p.spawnShieldUntil = Date.now() + SPAWN_PROTECTION_MS;
+  send(p.ws, {
+    type: 'state', id: p.id,
+    x: p.x, y: p.y, z: p.z,
+    yaw: p.yaw, pitch: p.pitch,
+    weapon: p.weapon, model: p.model,
+    hp: 100, godMode: p.godMode, crouched: false,
+    spawnShieldMs: SPAWN_PROTECTION_MS
+  });
+}
+
+function removeFromRoom(p) {
+  const players = rooms.get(p.room);
+  if (!players) return;
+  players.delete(p.id);
+  losLogAt.delete(p.id);
+  broadcast(p.room, { type: 'players', players: roster(p.room) });
+  if (players.size === 0) { rooms.delete(p.room); roomMaps.delete(p.room); }
+}
+
+function logLos(shooter, target, mapId) {
+  const now = Date.now();
+  if (now - (losLogAt.get(shooter.id) || 0) < 1000) return;
+  losLogAt.set(shooter.id, now);
+  console.log(`[los] ${LOS_MODE === 'enforce' ? 'rejected' : 'would reject'} hit ${shooter.name} -> ${target.name} on ${mapId}`);
 }
 
 const server = http.createServer((req, res) => {
@@ -102,15 +163,18 @@ wss.on('connection', (ws) => {
     if (m.type === 'ping') { send(ws, { type: 'pong', t: m.t }); return; }
 
     if (m.type === 'join') {
+      if (me) { removeFromRoom(me); me = null; }   // re-join: leave the old room properly
       const { key, players } = roomOf(m.room);
       if (players.size >= MAX_PER_ROOM) {
         send(ws, { type: 'error', message: 'Комната полная (макс 6)' });
         try { ws.close(4000, 'room full'); } catch {}
         return;
       }
-      if (me) players.delete(me.id);
+      // the first player of a room picks its map (default: arena); later joiners get that map
+      if (players.size === 0 || !roomMaps.has(key)) roomMaps.set(key, sanitizeMap(m.map) || DEFAULT_MAP);
+      const mapId = mapOfRoom(key);
       const id = String(nextId++);
-      const spawn = pickSpawn();
+      const spawn = pickSpawn(mapId, players, id);
       me = {
         id, ws, room: key,
         name: sanitizeName(m.name),
@@ -124,7 +188,8 @@ wss.on('connection', (ws) => {
       players.set(id, me);
       send(ws, {
         type: 'welcome', id, room: key,
-        mode: 'bots', map: 'arena',
+        mode: 'bots', map: mapId,
+        spawn: { x: spawn.x, y: spawn.y, z: spawn.z },
         spawnShieldMs: SPAWN_PROTECTION_MS,
         players: roster(key)
       });
@@ -181,15 +246,23 @@ wss.on('connection', (ws) => {
         const targetId = sanitizeId(m.target);
         const target = players.get(targetId);
         if (!target || target.id === me.id) break;
+
+        // no shooting through walls: the bullet path must be free of level geometry
+        if (LOS_MODE !== 'off') {
+          const mapId = mapOfRoom(me.room);
+          if (!hasLineOfSight(me, target, MAPS[mapId].boxes)) {
+            logLos(me, target, mapId);
+            if (LOS_MODE === 'enforce') break;
+          }
+        }
+
+        const dmg = clampNum(m.damage, MIN_DAMAGE, MAX_DAMAGE, 34);
         if (target.godMode) target.hp = 100;
         else if (target.spawnShieldUntil && Date.now() < target.spawnShieldUntil) {}
-        else {
-          const dmg = clampNum(m.damage, MIN_DAMAGE, MAX_DAMAGE, 34);
-          target.hp = Math.max(0, target.hp - dmg);
-        }
+        else target.hp = Math.max(0, target.hp - dmg);
         broadcast(me.room, {
           type: 'hit', target: target.id, killer: me.id,
-          name: me.name, hp: target.hp, damage: m.damage
+          name: me.name, hp: target.hp, damage: dmg
         });
         if (target.hp <= 0) {
           me.kills++; target.deaths++;
@@ -197,57 +270,41 @@ wss.on('connection', (ws) => {
             type: 'kill', killer: me.id, killerName: me.name,
             victim: target.id, victimName: target.name, weapon: me.weapon
           });
-          const sp = pickSpawn();
-          target.x = sp.x; target.y = sp.y; target.z = sp.z;
-          target.hp = 100;
-          target.spawnShieldUntil = Date.now() + SPAWN_PROTECTION_MS;
-          send(target.ws, {
-            type: 'state', id: target.id,
-            x: target.x, y: target.y, z: target.z,
-            yaw: target.yaw, pitch: target.pitch,
-            weapon: target.weapon, model: target.model,
-            hp: 100, godMode: target.godMode, crouched: false,
-            spawnShieldMs: SPAWN_PROTECTION_MS
-          });
+          respawn(target, players);
           broadcast(me.room, { type: 'players', players: roster(me.room) });
         }
         break;
       }
-      case 'respawn': {
-        const sp = pickSpawn();
-        me.x = sp.x; me.y = sp.y; me.z = sp.z;
-        me.hp = 100;
-        me.spawnShieldUntil = Date.now() + SPAWN_PROTECTION_MS;
-        send(ws, {
-          type: 'state', id: me.id,
-          x: me.x, y: me.y, z: me.z,
-          yaw: me.yaw, pitch: me.pitch,
-          weapon: me.weapon, model: me.model,
-          hp: 100, godMode: me.godMode, crouched: false,
-          spawnShieldMs: SPAWN_PROTECTION_MS
-        });
+      case 'respawn':
+        respawn(me, players);
         broadcast(me.room, { type: 'players', players: roster(me.room) }, me.id);
         break;
-      }
       case 'mode':
         if (typeof m.mode === 'string') broadcast(me.room, { type: 'mode', mode: m.mode.slice(0, 16) });
         break;
-      case 'map':
-        if (typeof m.map === 'string') broadcast(me.room, { type: 'map', map: m.map.slice(0, 32) });
+      case 'map': {
+        const mapId = sanitizeMap(m.map);
+        if (!mapId) break;
+        if (me.id !== ownerId(players)) {
+          send(ws, { type: 'notice', message: 'Карту меняет только создатель комнаты' });
+          break;
+        }
+        if (mapOfRoom(me.room) === mapId) break;
+        roomMaps.set(me.room, mapId);
+        broadcast(me.room, { type: 'map', map: mapId });
+        for (const p of players.values()) respawn(p, players);   // new map = new spawn points
+        broadcast(me.room, { type: 'players', players: roster(me.room) });
         break;
+      }
     }
   });
 
   ws.on('close', () => {
     if (!me) return;
-    const players = rooms.get(me.room);
-    if (players) {
-      players.delete(me.id);
-      broadcast(me.room, { type: 'players', players: roster(me.room) });
-      broadcast(me.room, { type: 'notice', message: me.name + ' вышел' });
-      if (players.size === 0) rooms.delete(me.room);
-    }
+    const leaving = me;
     me = null;
+    removeFromRoom(leaving);
+    broadcast(leaving.room, { type: 'notice', message: leaving.name + ' вышел' });
   });
   ws.on('error', () => { try { ws.close(); } catch {} });
 });
@@ -271,4 +328,4 @@ function shutdown(sig) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 
-server.listen(PORT, '0.0.0.0', () => console.log('Poligon MP v2 on port', PORT));
+server.listen(PORT, '0.0.0.0', () => console.log('Poligon MP v3 on port', PORT, '| LOS_MODE =', LOS_MODE));

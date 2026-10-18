@@ -10,6 +10,8 @@
  *  - 'hit' is rejected when there is a wall between shooter and target (no shooting through walls)
  *    LOS_MODE env: enforce (default) | log (only log would-be rejections) | off
  *  - fixed: re-joining another room left a ghost player in the old room
+ *  - grenades: 'grenadeThrow' / 'grenadeDet' are relayed to the room so everybody sees them;
+ *    'hit' with weapon 'grenade*' skips the wall check (blast radius, not a bullet) and may hit the thrower
  */
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -26,6 +28,10 @@ const MIN_DAMAGE = 1;
 const STATE_MIN_INTERVAL_MS = 30;
 const SPAWN_PROTECTION_MS = 3000;
 const HEARTBEAT_MS = 25000;
+const GRENADE_KINDS = new Set(['he', 'flash', 'smoke', 'molotov']);
+const GRENADE_THROW_COOLDOWN_MS = 250;   // not more than ~4 throws per second per player
+const GRENADE_HIT_WINDOW_MS = 20000;     // grenade damage is accepted only shortly after that player threw one
+const MAX_GRENADE_SPEED = 60;
 
 const rooms = new Map();      // room key -> Map(playerId -> player)
 const roomMaps = new Map();   // room key -> map id
@@ -183,6 +189,7 @@ wss.on('connection', (ws) => {
         model: sanitizeId(m.model) || 'chicken',
         hp: 100, godMode: false, crouched: false,
         kills: 0, deaths: 0,
+        lastGrenadeAt: 0, lastGrenadeThrowAt: 0,
         spawnShieldUntil: Date.now() + SPAWN_PROTECTION_MS
       };
       players.set(id, me);
@@ -242,13 +249,46 @@ wss.on('connection', (ws) => {
         if (typeof m.action === 'string' && m.action.length < 24)
           broadcast(me.room, { type: 'weaponAction', id: me.id, weapon: me.weapon, action: m.action }, me.id);
         break;
+      case 'grenadeThrow': {
+        const kind = String(m.kind || '').toLowerCase();
+        if (!GRENADE_KINDS.has(kind)) break;
+        const now = Date.now();
+        if (now - me.lastGrenadeThrowAt < GRENADE_THROW_COOLDOWN_MS) break;
+        me.lastGrenadeThrowAt = now;
+        me.lastGrenadeAt = now;
+        broadcast(me.room, {
+          type: 'grenadeThrow', id: me.id, kind,
+          seq: Math.floor(clampNum(m.seq, 0, 1000000, 0)),
+          x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
+          y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
+          z: clampNum(m.z, -MAX_POS, MAX_POS, me.z),
+          vx: clampNum(m.vx, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0),
+          vy: clampNum(m.vy, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0),
+          vz: clampNum(m.vz, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0)
+        }, me.id);
+        break;
+      }
+      case 'grenadeDet':
+        me.lastGrenadeAt = Date.now();
+        broadcast(me.room, {
+          type: 'grenadeDet', id: me.id,
+          seq: Math.floor(clampNum(m.seq, 0, 1000000, 0)),
+          x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
+          y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
+          z: clampNum(m.z, -MAX_POS, MAX_POS, me.z)
+        }, me.id);
+        break;
       case 'hit': {
         const targetId = sanitizeId(m.target);
         const target = players.get(targetId);
-        if (!target || target.id === me.id) break;
+        const viaGrenade = typeof m.weapon === 'string' && m.weapon.startsWith('grenade');
+        if (!target) break;
+        if (target.id === me.id && !viaGrenade) break;                       // only a grenade can hurt its thrower
+        if (viaGrenade && Date.now() - me.lastGrenadeAt > GRENADE_HIT_WINDOW_MS) break;
 
         // no shooting through walls: the bullet path must be free of level geometry
-        if (LOS_MODE !== 'off') {
+        // (not applied to grenades: the blast is checked by the thrower's client)
+        if (LOS_MODE !== 'off' && !viaGrenade) {
           const mapId = mapOfRoom(me.room);
           if (!hasLineOfSight(me, target, MAPS[mapId].boxes)) {
             logLos(me, target, mapId);
@@ -265,7 +305,8 @@ wss.on('connection', (ws) => {
           name: me.name, hp: target.hp, damage: dmg
         });
         if (target.hp <= 0) {
-          me.kills++; target.deaths++;
+          if (target.id !== me.id) me.kills++;   // a self-kill is not a kill
+          target.deaths++;
           broadcast(me.room, {
             type: 'kill', killer: me.id, killerName: me.name,
             victim: target.id, victimName: target.name, weapon: me.weapon

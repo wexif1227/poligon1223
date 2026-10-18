@@ -257,8 +257,7 @@ wss.on('connection', (ws) => {
         me.lastGrenadeThrowAt = now;
         me.lastGrenadeAt = now;
         broadcast(me.room, {
-          type: 'grenadeThrow', id: me.id, kind,
-          seq: Math.floor(clampNum(m.seq, 0, 1000000, 0)),
+          type: 'grenadeThrow', id: me.id, kind, gid: sanitizeId(m.gid),
           x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
           y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
           z: clampNum(m.z, -MAX_POS, MAX_POS, me.z),
@@ -268,16 +267,17 @@ wss.on('connection', (ws) => {
         }, me.id);
         break;
       }
-      case 'grenadeDet':
+      case 'grenadeDet': {
+        const dkind = String(m.kind || '').toLowerCase();
         me.lastGrenadeAt = Date.now();
         broadcast(me.room, {
-          type: 'grenadeDet', id: me.id,
-          seq: Math.floor(clampNum(m.seq, 0, 1000000, 0)),
+          type: 'grenadeDet', id: me.id, gid: sanitizeId(m.gid), kind: GRENADE_KINDS.has(dkind) ? dkind : '',
           x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
           y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
           z: clampNum(m.z, -MAX_POS, MAX_POS, me.z)
         }, me.id);
         break;
+      }
       case 'hit': {
         const targetId = sanitizeId(m.target);
         const target = players.get(targetId);

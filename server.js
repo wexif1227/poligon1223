@@ -1,89 +1,47 @@
 /**
- * Poligon multiplayer server — v3
- * Render: Web Service, Start: node server.js, Health: /health
- *
- * v3 (on top of v2):
- *  - every room has a map (arena | mirage | sandstone | province | rust | zone9), chosen by the
- *    first player via {type:'join', map:'province'} and reported back in 'welcome'
- *  - spawn points come from the room's map (maps.js) and prefer the point farthest from other players
- *  - only the room owner (oldest player) can change the map; a change respawns everyone
- *  - 'hit' is rejected when there is a wall between shooter and target (no shooting through walls)
- *    LOS_MODE env: enforce (default) | log (only log would-be rejections) | off
- *  - fixed: re-joining another room left a ghost player in the old room
- *  - grenades: 'grenadeThrow' / 'grenadeDet' are relayed to the room so everybody sees them;
- *    'hit' with weapon 'grenade*' skips the wall check (blast radius, not a bullet) and may hit the thrower
+ * Poligon multiplayer server — compatible with HTML and Unity clients.
+ * Deploy on Render: Web Service, start command `node server.js`
+ * Protocol: JSON over WebSocket, max 6 players per room.
  */
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { MAPS, DEFAULT_MAP, hasLineOfSight } = require('./maps');
 
 const PORT = process.env.PORT || 3000;
-const LOS_MODE = String(process.env.LOS_MODE || 'enforce').toLowerCase();
 const MAX_PER_ROOM = 6;
-const MAX_NAME_LEN = 18;
-const MAX_ROOM_LEN = 12;
-const MAX_POS = 500;
-const MAX_DAMAGE = 100;
-const MIN_DAMAGE = 1;
-const STATE_MIN_INTERVAL_MS = 30;
-const SPAWN_PROTECTION_MS = 3000;
-const HEARTBEAT_MS = 25000;
-const GRENADE_KINDS = new Set(['he', 'flash', 'smoke', 'molotov']);
-const GRENADE_THROW_COOLDOWN_MS = 250;   // not more than ~4 throws per second per player
-const GRENADE_HIT_WINDOW_MS = 20000;     // grenade damage is accepted only shortly after that player threw one
-const MAX_GRENADE_SPEED = 60;
 
-const rooms = new Map();      // room key -> Map(playerId -> player)
-const roomMaps = new Map();   // room key -> map id
-const losLogAt = new Map();   // shooter id -> last LOS log time (keeps the log readable)
-
-const clampNum = (v, min, max, fb = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fb;
-};
-const sanitizeName = (v, fb = 'Игрок') => {
-  const s = String(v ?? fb).replace(/[\r\n\t]+/g, ' ').trim().slice(0, MAX_NAME_LEN);
-  return s || fb;
-};
-const sanitizeRoom = (v) => {
-  const s = String(v ?? 'LOBBY').toUpperCase().replace(/[^A-Z0-9_\-]/g, '').slice(0, MAX_ROOM_LEN);
-  return s || 'LOBBY';
-};
-const sanitizeId = (v) => String(v ?? '').replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 24);
-// 'Zone9', 'zone_9', 'ZONE9' -> 'zone9'; unknown -> null
-const sanitizeMap = (v) => {
-  const s = String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  return Object.prototype.hasOwnProperty.call(MAPS, s) ? s : null;
-};
+const roomSettings = new Map();
+const maps = new Set(['mirage', 'sandstone', 'rust', 'arena', 'province', 'zone9']);
+const activeGrenades = new Map();
+const grenadeKinds = new Set(['he', 'flash', 'smoke', 'molotov']);
+const validPosition = m => ['x', 'y', 'z'].every(k => Number.isFinite(m[k]) && Math.abs(m[k]) <= 1000);
+// Expire lost throws without trusting unbounded client-owned state.
+const cleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, g] of activeGrenades) if (now - g.created > 15000) activeGrenades.delete(key);
+}, 5000);
+cleanup.unref();
+const rooms = new Map(); // roomCode -> Map(id -> player)
 
 function roomOf(code) {
-  const key = sanitizeRoom(code);
+  const key = String(code || 'LOBBY').toUpperCase().slice(0, 12);
   if (!rooms.has(key)) rooms.set(key, new Map());
   return { key, players: rooms.get(key) };
 }
-function mapOfRoom(key) { return roomMaps.get(key) || DEFAULT_MAP; }
-function ownerId(players) {
-  let best = null;
-  for (const id of players.keys()) if (best === null || Number(id) < Number(best)) best = id;
-  return best;
-}
+
 function publicPlayer(p) {
   return {
-    id: p.id, name: p.name,
+    id: p.id,
+    name: p.name,
     x: p.x, y: p.y, z: p.z,
     yaw: p.yaw, pitch: p.pitch,
-    weapon: p.weapon, model: p.model,
-    hp: p.hp, godMode: !!p.godMode, crouched: !!p.crouched,
-    kills: p.kills, deaths: p.deaths
+    weapon: p.weapon,
+    hp: p.hp,
+    godMode: !!p.godMode
   };
 }
-function roster(key) {
-  const players = rooms.get(key);
-  return players ? [...players.values()].map(publicPlayer) : [];
-}
-function send(ws, obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-function broadcast(key, obj, exceptId = null) {
-  const players = rooms.get(key);
+
+function broadcast(roomKey, obj, exceptId = null) {
+  const players = rooms.get(roomKey);
   if (!players) return;
   const raw = JSON.stringify(obj);
   for (const p of players.values()) {
@@ -92,114 +50,55 @@ function broadcast(key, obj, exceptId = null) {
   }
 }
 
-// Spawn of the room's map: the point farthest from everybody else (small random term breaks ties),
-// plus a little jitter so two players spawning in a row do not stand on the same spot.
-function pickSpawn(mapId, players, exceptId) {
-  const list = (MAPS[mapId] || MAPS[DEFAULT_MAP]).spawns;
-  const others = [];
-  if (players) for (const p of players.values()) if (p.id !== exceptId) others.push(p);
-  let best = list[0], bestScore = -1;
-  for (const s of list) {
-    let d = Infinity;
-    for (const p of others) d = Math.min(d, Math.hypot(p.x - s[0], p.z - s[2]));
-    const score = (others.length ? Math.min(d, 60) : 0) + Math.random() * 2;
-    if (score > bestScore) { bestScore = score; best = s; }
-  }
-  return {
-    x: best[0] + (Math.random() - 0.5) * 1.2,
-    y: best[1],
-    z: best[2] + (Math.random() - 0.5) * 1.2
-  };
-}
-
-// Authoritative respawn: new position, full hp, spawn shield; the player is told with a 'state'.
-function respawn(p, players) {
-  const sp = pickSpawn(mapOfRoom(p.room), players, p.id);
-  p.x = sp.x; p.y = sp.y; p.z = sp.z;
-  p.hp = 100;
-  p.spawnShieldUntil = Date.now() + SPAWN_PROTECTION_MS;
-  send(p.ws, {
-    type: 'state', id: p.id,
-    x: p.x, y: p.y, z: p.z,
-    yaw: p.yaw, pitch: p.pitch,
-    weapon: p.weapon, model: p.model,
-    hp: 100, godMode: p.godMode, crouched: false,
-    spawnShieldMs: SPAWN_PROTECTION_MS
-  });
-}
-
-function removeFromRoom(p) {
-  const players = rooms.get(p.room);
-  if (!players) return;
-  players.delete(p.id);
-  losLogAt.delete(p.id);
-  broadcast(p.room, { type: 'players', players: roster(p.room) });
-  if (players.size === 0) { rooms.delete(p.room); roomMaps.delete(p.room); }
-}
-
-function logLos(shooter, target, mapId) {
-  const now = Date.now();
-  if (now - (losLogAt.get(shooter.id) || 0) < 1000) return;
-  losLogAt.set(shooter.id, now);
-  console.log(`[los] ${LOS_MODE === 'enforce' ? 'rejected' : 'would reject'} hit ${shooter.name} -> ${target.name} on ${mapId}`);
+function roster(roomKey) {
+  const players = rooms.get(roomKey);
+  if (!players) return [];
+  return [...players.values()].map(publicPlayer);
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('OK'); return;
-  }
-  res.writeHead(404); res.end();
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Poligon MP server OK\n');
 });
 
-const wss = new WebSocketServer({ server, maxPayload: 8 * 1024 });
+const wss = new WebSocketServer({ server, maxPayload: 16384 });
+
 let nextId = 1;
 
 wss.on('connection', (ws) => {
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
   let me = null;
-  let lastStateAt = 0;
 
   ws.on('message', (buf) => {
     let m;
     try { m = JSON.parse(buf.toString()); } catch { return; }
     if (!m || typeof m.type !== 'string') return;
 
-    if (m.type === 'ping') { send(ws, { type: 'pong', t: m.t }); return; }
-
     if (m.type === 'join') {
-      if (me) { removeFromRoom(me); me = null; }   // re-join: leave the old room properly
+      if (me) return;
       const { key, players } = roomOf(m.room);
       if (players.size >= MAX_PER_ROOM) {
-        send(ws, { type: 'error', message: 'Комната полная (макс 6)' });
-        try { ws.close(4000, 'room full'); } catch {}
+        ws.send(JSON.stringify({ type: 'error', message: 'Комната полная (макс 6)' }));
         return;
       }
-      // the first player of a room picks its map (default: arena); later joiners get that map
-      if (players.size === 0 || !roomMaps.has(key)) roomMaps.set(key, sanitizeMap(m.map) || DEFAULT_MAP);
-      const mapId = mapOfRoom(key);
+      if (!roomSettings.has(key)) roomSettings.set(key, { map: maps.has(m.map) ? m.map : 'mirage', mode: 'bots' });
+      const settings = roomSettings.get(key);
       const id = String(nextId++);
-      const spawn = pickSpawn(mapId, players, id);
       me = {
         id, ws, room: key,
-        name: sanitizeName(m.name),
-        x: spawn.x, y: spawn.y, z: spawn.z,
-        yaw: 0, pitch: 0, weapon: 'ak47',
-        model: sanitizeId(m.model) || 'chicken',
-        hp: 100, godMode: false, crouched: false,
-        kills: 0, deaths: 0,
-        lastGrenadeAt: 0, lastGrenadeThrowAt: 0,
-        spawnShieldUntil: Date.now() + SPAWN_PROTECTION_MS
+        name: String(m.name || 'Игрок').slice(0, 18),
+        x: 0, y: 1.6, z: 8, yaw: 0, pitch: 0,
+        weapon: 'ak47', hp: 100, godMode: false,
+        kills: 0, deaths: 0
       };
       players.set(id, me);
-      send(ws, {
-        type: 'welcome', id, room: key,
-        mode: 'bots', map: mapId,
-        spawn: { x: spawn.x, y: spawn.y, z: spawn.z },
-        spawnShieldMs: SPAWN_PROTECTION_MS,
-        players: roster(key)
-      });
+      ws.send(JSON.stringify({
+        type: 'welcome',
+        id,
+        room: key,
+        players: roster(key),
+        mode: settings.mode,
+        map: settings.map
+      }));
       broadcast(key, { type: 'players', players: roster(key) }, id);
       broadcast(key, { type: 'notice', message: me.name + ' вошёл в комнату' });
       return;
@@ -207,166 +106,124 @@ wss.on('connection', (ws) => {
 
     if (!me) return;
     const players = rooms.get(me.room);
-    if (!players || !players.has(me.id)) return;
+    if (!players) return;
 
     switch (m.type) {
-      case 'state': {
-        const now = Date.now();
-        if (now - lastStateAt < STATE_MIN_INTERVAL_MS) return;
-        lastStateAt = now;
-        me.x = clampNum(m.x, -MAX_POS, MAX_POS, me.x);
-        me.y = clampNum(m.y, -MAX_POS, MAX_POS, me.y);
-        me.z = clampNum(m.z, -MAX_POS, MAX_POS, me.z);
-        me.yaw = clampNum(m.yaw, -Math.PI * 2, Math.PI * 2, me.yaw);
-        me.pitch = clampNum(m.pitch, -2, 2, me.pitch);
-        if (typeof m.weapon === 'string') me.weapon = m.weapon.slice(0, 16);
-        if (typeof m.model === 'string') me.model = sanitizeId(m.model) || me.model;
-        if (typeof m.crouched === 'boolean') me.crouched = m.crouched;
-        if (typeof m.godMode === 'boolean') me.godMode = m.godMode;
+      case 'state':
+        me.x = +m.x || 0; me.y = +m.y || 0; me.z = +m.z || 0;
+        me.yaw = +m.yaw || 0; me.pitch = +m.pitch || 0;
+        if (m.weapon) me.weapon = String(m.weapon);
+        me.godMode = !!m.godMode;
+        if (typeof m.hp === 'number') me.hp = m.hp;
         broadcast(me.room, {
-          type: 'state', id: me.id,
+          type: 'state',
+          id: me.id,
           x: me.x, y: me.y, z: me.z,
           yaw: me.yaw, pitch: me.pitch,
-          weapon: me.weapon, model: me.model,
-          hp: me.hp, godMode: me.godMode, crouched: me.crouched
+          weapon: me.weapon, hp: me.hp, godMode: me.godMode
         }, me.id);
         break;
+
+      case 'grenadeThrow': {
+        if (typeof m.gid !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(m.gid) ||
+            !grenadeKinds.has(m.kind) || !validPosition(m) ||
+            !['vx', 'vy', 'vz'].every(k => Number.isFinite(m[k]) && Math.abs(m[k]) <= 100)) break;
+        const now = Date.now();
+        if (now - (me.lastGrenade || 0) < 300) break;
+        const key = me.room + ':' + m.gid;
+        if (activeGrenades.has(key)) break;
+        me.lastGrenade = now;
+        activeGrenades.set(key, { owner: me.id, room: me.room, kind: m.kind, created: now });
+        broadcast(me.room, { type: 'grenadeThrow', id: me.id, gid: m.gid, kind: m.kind,
+          x: m.x, y: m.y, z: m.z, vx: m.vx, vy: m.vy, vz: m.vz }, me.id);
+        break;
       }
-      case 'characterModel':
-        me.model = sanitizeId(m.model) || me.model;
-        broadcast(me.room, {
-          type: 'state', id: me.id,
-          x: me.x, y: me.y, z: me.z,
-          yaw: me.yaw, pitch: me.pitch,
-          weapon: me.weapon, model: me.model,
-          hp: me.hp, godMode: me.godMode, crouched: me.crouched
-        }, me.id);
+      case 'grenadeDet': {
+        const key = me.room + ':' + m.gid;
+        const g = activeGrenades.get(key);
+        if (!g || g.owner !== me.id || g.detonated || !validPosition(m) || Date.now() - g.created > 15000) break;
+        g.detonated = true;
+        broadcast(me.room, { type: 'grenadeDet', id: me.id, gid: m.gid, kind: g.kind,
+          x: m.x, y: m.y, z: m.z }, me.id);
+        break;
+      }
+      case 'weaponAction':
+        if (typeof m.action === 'string')
+          broadcast(me.room, { type: 'weaponAction', id: me.id, weapon: me.weapon, action: m.action.slice(0, 64) }, me.id);
         break;
       case 'shot':
         broadcast(me.room, { type: 'shot', id: me.id, weapon: m.weapon || me.weapon }, me.id);
         break;
-      case 'weaponAction':
-        if (typeof m.action === 'string' && m.action.length < 24)
-          broadcast(me.room, { type: 'weaponAction', id: me.id, weapon: me.weapon, action: m.action }, me.id);
-        break;
-      case 'grenadeThrow': {
-        const kind = String(m.kind || '').toLowerCase();
-        if (!GRENADE_KINDS.has(kind)) break;
-        const now = Date.now();
-        if (now - me.lastGrenadeThrowAt < GRENADE_THROW_COOLDOWN_MS) break;
-        me.lastGrenadeThrowAt = now;
-        me.lastGrenadeAt = now;
-        broadcast(me.room, {
-          type: 'grenadeThrow', id: me.id, kind, gid: sanitizeId(m.gid),
-          x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
-          y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
-          z: clampNum(m.z, -MAX_POS, MAX_POS, me.z),
-          vx: clampNum(m.vx, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0),
-          vy: clampNum(m.vy, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0),
-          vz: clampNum(m.vz, -MAX_GRENADE_SPEED, MAX_GRENADE_SPEED, 0)
-        }, me.id);
-        break;
-      }
-      case 'grenadeDet': {
-        const dkind = String(m.kind || '').toLowerCase();
-        me.lastGrenadeAt = Date.now();
-        broadcast(me.room, {
-          type: 'grenadeDet', id: me.id, gid: sanitizeId(m.gid), kind: GRENADE_KINDS.has(dkind) ? dkind : '',
-          x: clampNum(m.x, -MAX_POS, MAX_POS, me.x),
-          y: clampNum(m.y, -MAX_POS, MAX_POS, me.y),
-          z: clampNum(m.z, -MAX_POS, MAX_POS, me.z)
-        }, me.id);
-        break;
-      }
+
       case 'hit': {
-        const targetId = sanitizeId(m.target);
-        const target = players.get(targetId);
-        const viaGrenade = typeof m.weapon === 'string' && m.weapon.startsWith('grenade');
+        const target = players.get(String(m.target));
         if (!target) break;
-        if (target.id === me.id && !viaGrenade) break;                       // only a grenade can hurt its thrower
-        if (viaGrenade && Date.now() - me.lastGrenadeAt > GRENADE_HIT_WINDOW_MS) break;
-
-        // no shooting through walls: the bullet path must be free of level geometry
-        // (not applied to grenades: the blast is checked by the thrower's client)
-        if (LOS_MODE !== 'off' && !viaGrenade) {
-          const mapId = mapOfRoom(me.room);
-          if (!hasLineOfSight(me, target, MAPS[mapId].boxes)) {
-            logLos(me, target, mapId);
-            if (LOS_MODE === 'enforce') break;
-          }
+        if (target.godMode) {
+          target.hp = 100;
+        } else {
+          const dmg = Math.max(1, Math.min(100, +m.damage || 34));
+          target.hp = Math.max(0, target.hp - dmg);
         }
-
-        const dmg = clampNum(m.damage, MIN_DAMAGE, MAX_DAMAGE, 34);
-        if (target.godMode) target.hp = 100;
-        else if (target.spawnShieldUntil && Date.now() < target.spawnShieldUntil) {}
-        else target.hp = Math.max(0, target.hp - dmg);
-        broadcast(me.room, {
-          type: 'hit', target: target.id, killer: me.id,
-          name: me.name, hp: target.hp, damage: dmg
-        });
+        const payload = {
+          type: 'hit',
+          target: target.id,
+          killer: me.id,
+          name: me.name,
+          hp: target.hp,
+          damage: m.damage
+        };
+        // send to everyone including attacker & victim
+        const raw = JSON.stringify(payload);
+        for (const p of players.values()) {
+          if (p.ws && p.ws.readyState === 1) p.ws.send(raw);
+        }
         if (target.hp <= 0) {
-          if (target.id !== me.id) me.kills++;   // a self-kill is not a kill
+          me.kills++;
           target.deaths++;
-          broadcast(me.room, {
-            type: 'kill', killer: me.id, killerName: me.name,
-            victim: target.id, victimName: target.name, weapon: me.weapon
-          });
-          respawn(target, players);
-          broadcast(me.room, { type: 'players', players: roster(me.room) });
+          target.hp = 100;
+          broadcast(me.room, { type: 'notice', message: me.name + ' убил ' + target.name });
         }
         break;
       }
+
       case 'respawn':
-        respawn(me, players);
-        broadcast(me.room, { type: 'players', players: roster(me.room) }, me.id);
-        break;
-      case 'mode':
-        if (typeof m.mode === 'string') broadcast(me.room, { type: 'mode', mode: m.mode.slice(0, 16) });
-        break;
-      case 'map': {
-        const mapId = sanitizeMap(m.map);
-        if (!mapId) break;
-        if (me.id !== ownerId(players)) {
-          send(ws, { type: 'notice', message: 'Карту меняет только создатель комнаты' });
-          break;
-        }
-        if (mapOfRoom(me.room) === mapId) break;
-        roomMaps.set(me.room, mapId);
-        broadcast(me.room, { type: 'map', map: mapId });
-        for (const p of players.values()) respawn(p, players);   // new map = new spawn points
+        me.hp = 100;
+        me.x = 0; me.y = 1.6; me.z = 8;
         broadcast(me.room, { type: 'players', players: roster(me.room) });
         break;
-      }
+
+      case 'mode':
+        if (typeof m.mode !== 'string') break;
+        roomSettings.get(me.room).mode = m.mode.slice(0, 32);
+        broadcast(me.room, { type: 'mode', mode: m.mode });
+        break;
+
+      case 'map':
+        if (!maps.has(m.map)) break;
+        roomSettings.get(me.room).map = m.map;
+        for (const [key, g] of activeGrenades) if (g.room === me.room) activeGrenades.delete(key);
+        broadcast(me.room, { type: 'map', map: m.map });
+        break;
+
+      default:
+        break;
     }
   });
 
   ws.on('close', () => {
     if (!me) return;
-    const leaving = me;
+    for (const [key, g] of activeGrenades) if (g.owner === me.id) activeGrenades.delete(key);
+    const players = rooms.get(me.room);
+    if (players) {
+      players.delete(me.id);
+      broadcast(me.room, { type: 'players', players: roster(me.room) });
+      broadcast(me.room, { type: 'notice', message: me.name + ' вышел' });
+      if (players.size === 0) { rooms.delete(me.room); roomSettings.delete(me.room); }
+    }
     me = null;
-    removeFromRoom(leaving);
-    broadcast(leaving.room, { type: 'notice', message: leaving.name + ' вышел' });
   });
-  ws.on('error', () => { try { ws.close(); } catch {} });
 });
 
-const hb = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  }
-}, HEARTBEAT_MS);
-hb.unref();
-
-function shutdown(sig) {
-  console.log('Shutting down', sig);
-  clearInterval(hb);
-  try { wss.close(); } catch {}
-  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
-  setTimeout(() => process.exit(0), 4000).unref();
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
-
-server.listen(PORT, '0.0.0.0', () => console.log('Poligon MP v3 on port', PORT, '| LOS_MODE =', LOS_MODE));
+server.listen(PORT, () => {
+  console.log('Poligon MP on port', server.address().port);
+});

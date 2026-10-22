@@ -12,7 +12,7 @@ const MAX_PER_ROOM = 6;
 const roomSettings = new Map();
 const maps = new Set(['mirage', 'sandstone', 'rust', 'arena', 'province', 'zone9']);
 const characterModels = new Set(['chicken', 'anime3d', 'anime1', 'anime2', 'anime3', 'annie', 'bikini', 'elf']);
-const emotes = new Set(['orange', 'floss', 'shuffle', 'robot']);
+const emotes = new Set(['orange', 'floss', 'shuffle', 'robot', 'takel', 'bestmates', 'electro', 'dab', 'wave', 'facepalm', 'laugh', 'cheer']);
 const activeGrenades = new Map();
 const grenadeKinds = new Set(['he', 'flash', 'smoke', 'molotov']);
 const validPosition = m => ['x', 'y', 'z'].every(k => Number.isFinite(m[k]) && Math.abs(m[k]) <= 1000);

@@ -13,6 +13,7 @@ const roomSettings = new Map();
 const maps = new Set(['mirage', 'sandstone', 'rust', 'arena', 'province', 'zone9']);
 const characterModels = new Set(['chicken', 'anime3d', 'anime1', 'anime2', 'anime3', 'annie', 'bikini', 'elf']);
 const emotes = new Set(['orange', 'floss', 'shuffle', 'robot', 'takel', 'bestmates', 'electro', 'dab', 'wave', 'facepalm', 'laugh', 'cheer']);
+const teams = new Set(['t', 'ct']);
 const activeGrenades = new Map();
 const grenadeKinds = new Set(['he', 'flash', 'smoke', 'molotov']);
 const validPosition = m => ['x', 'y', 'z'].every(k => Number.isFinite(m[k]) && Math.abs(m[k]) <= 1000);
@@ -44,7 +45,10 @@ function publicPlayer(p) {
     grounded: !!p.grounded,
     hasAnimationState: !!p.hasAnimationState,
     emote: p.emote || '',
-    emoteTime: emoteTime(p)
+    emoteTime: emoteTime(p),
+    team: p.team || 't',
+    kills: p.kills || 0,
+    deaths: p.deaths || 0
   };
 }
 
@@ -107,9 +111,16 @@ wss.on('connection', (ws) => {
       if (!roomSettings.has(key)) roomSettings.set(key, { map: maps.has(m.map) ? m.map : 'mirage', mode: 'bots' });
       const settings = roomSettings.get(key);
       const id = String(nextId++);
+      let team = teams.has(m.team) ? m.team : '';
+      if (!team) {
+        let tCount = 0, ctCount = 0;
+        for (const p of players.values()) (p.team === 'ct' ? ctCount++ : tCount++);
+        team = tCount <= ctCount ? 't' : 'ct';
+      }
       me = {
         id, ws, room: key,
         name: String(m.name || 'Игрок').slice(0, 18),
+        team,
         x: 0, y: 1.6, z: 8, yaw: 0, pitch: 0,
         weapon: 'ak47', hp: 100, godMode: false,
         model: characterModels.has(m.model) ? m.model : 'chicken',
@@ -124,7 +135,8 @@ wss.on('connection', (ws) => {
         room: key,
         players: roster(key),
         mode: settings.mode,
-        map: settings.map
+        map: settings.map,
+        team
       }));
       broadcast(key, { type: 'players', players: roster(key) }, id);
       broadcast(key, { type: 'notice', message: me.name + ' вошёл в комнату' });
@@ -156,7 +168,9 @@ wss.on('connection', (ws) => {
           weapon: me.weapon, hp: me.hp, godMode: me.godMode,
           model: me.model, crouched: me.crouched,
           grounded: me.grounded, hasAnimationState: me.hasAnimationState,
-          emote: me.emote, emoteTime: emoteTime(me)
+          emote: me.emote, emoteTime: emoteTime(me),
+          team: me.team,
+          kills: me.kills, deaths: me.deaths
         }, me.id);
         break;
 
@@ -210,6 +224,7 @@ wss.on('connection', (ws) => {
       case 'hit': {
         const target = players.get(String(m.target));
         if (!target) break;
+        if (target.team && me.team && target.team === me.team) break;
         if (target.godMode) {
           target.hp = 100;
         } else {
@@ -234,6 +249,12 @@ wss.on('connection', (ws) => {
           me.kills++;
           target.deaths++;
           target.hp = 100;
+          broadcast(me.room, {
+            type: 'kill',
+            killerName: me.name,
+            victimName: target.name,
+            weapon: me.weapon
+          });
           broadcast(me.room, { type: 'notice', message: me.name + ' убил ' + target.name });
         }
         break;
@@ -244,7 +265,15 @@ wss.on('connection', (ws) => {
         me.hp = 100;
         me.crouched = false;
         me.grounded = false;
-        me.x = 0; me.y = 1.6; me.z = 8;
+        // The client picks a spawn from its team's list and reports it in the next state.
+        broadcast(me.room, { type: 'players', players: roster(me.room) });
+        break;
+
+      case 'team':
+        if (!teams.has(m.team) || me.team === m.team) break;
+        stopEmote(me);
+        me.team = m.team;
+        me.hp = 100;
         broadcast(me.room, { type: 'players', players: roster(me.room) });
         break;
 

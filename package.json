@@ -1,7 +1,7 @@
 {
   "name": "poligon-mp-server",
-  "version": "3.1.0",
-  "description": "Poligon 3.1 WebSocket multiplayer server: T/CT teams, team spawns and the shared game protocol.",
+  "version": "2.7.0",
+  "description": "Poligon 2.7 WebSocket server: T/CT teams, round mode, bomb objective, teams and the shared game protocol.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
